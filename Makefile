@@ -1,4 +1,4 @@
-#
+
 # You can tweak these three variables to make things install where you
 # like, but do not touch more unless you know what you are doing. ;)
 #
@@ -127,3 +127,8 @@ distclean: clean
 		fakeroot rpm/rules clean; \
 	fi
 	@rm -f *.exe *.deb *.rpm *.tgz *.tar.gz *.tar.bz2 tags ctags pid 2>/dev/null
+
+# There are no tests, this is added to travis CI can at least confirm
+# compilation occurred
+test:	$(NAME)
+  
