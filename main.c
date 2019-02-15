@@ -41,6 +41,7 @@
 #include <syslog.h>
 #include <termios.h>
 #include <fnmatch.h>
+#include <time.h>
 
 /*
  * Some helping routines like linked list manipulation substr(), memory
@@ -77,6 +78,15 @@ int serialize = 0;
 int scanner_plugin = 0;
 long scanner_plugin_maxsize = 0;
 
+/* Whether we should fall back to direct connection if we can't
+ * connect to any proxies
+ *
+ * defaults to old behaviour to avoid breaking old configs
+ */
+int fallback_allow = 0;
+int fallback_retry_rate = 10;		/* default retry rate of 10 seconds */
+int fallback_active = 0;				/* whether we're actively falling back */
+time_t fallback_start = NULL;		/* the time we started falling back */
 /*
  * List of finished threads. Each forward_request() thread adds itself to it when
  * finished. Main regularly joins and removes all tid's in there.
@@ -97,7 +107,7 @@ int parent_count = 0;
 plist_t parent_list = NULL;
 
 /*
- * List of custom header substitutions, SOCKS5 proxy users and 
+ * List of custom header substitutions, SOCKS5 proxy users and
  * UserAgents for the scanner plugin.
  */
 hlist_t header_list = NULL;			/* forward_request() */
@@ -340,10 +350,42 @@ void *proxy_thread(void *thread_data) {
 
 			keep_alive = hlist_subcmp(request->headers, "Proxy-Connection", "keep-alive");
 
-			if (noproxy_match(request->hostname))
+			if (fallback_active) {
+				time_t now;
+				double elapsed_seconds;
+
+				time(&now);
+				elapsed_seconds = difftime(now, fallback_start);
+
+				if (debug) {
+					printf("Fallback: active for %d of %d seconds\n", (int)elapsed_seconds, fallback_retry_rate);
+				}
+
+				if (elapsed_seconds >= fallback_retry_rate) {
+					if (debug) {
+						printf("Fallback: reached retry timeout - retrying regular proxy connection...\n");
+					}
+					fallback_active = 0;
+					fallback_start = NULL;
+				}
+			}
+
+			if (noproxy_match(request->hostname) || fallback_active)
 				ret = direct_request(thread_data, request);
-			else
+			else {
 				ret = forward_request(thread_data, request);
+
+				/* fallback: activate fallback if forward_request() failed */
+				if (fallback_allow && (ret == NULL || ret == (void *)-1) ) {
+					if (debug) {
+						printf("Fallback: proxied connections failed, falling back...\n");
+					}
+					time(&fallback_start);
+					fallback_active = 1;
+					ret = direct_request(thread_data, request);
+				}
+
+			}
 
 			if (debug)
 				printf("proxy_thread: request rc = %x\n", (int)ret);
@@ -1091,6 +1133,26 @@ int main(int argc, char **argv) {
 			free(tmp);
 		}
 
+		if ((tmp = config_pop(cf, "FallbackEnable"))) {
+			if (strlen(tmp)) {
+				if (debug) {
+					printf("Enabling fallback\n");
+				}
+				fallback_allow = 1;
+			}
+			free(tmp);
+		}
+
+		if ((tmp = config_pop(cf, "FallbackRetryRate"))) {
+			if (strlen(tmp)) {
+				if (debug) {
+					printf("Setting fallback retry rate to: %s\n", tmp);
+				}
+				fallback_retry_rate = atoi(tmp);
+			}
+			free(tmp);
+		}
+
 		while ((tmp = config_pop(cf, "SOCKS5Users"))) {
 			head = strchr(tmp, ':');
 			if (!head) {
@@ -1100,7 +1162,7 @@ int main(int argc, char **argv) {
 				users_list = hlist_add(users_list, tmp, head+1, HLIST_ALLOC, HLIST_ALLOC);
 			}
 		}
-					
+
 
 		/*
 		 * Add User-Agent matching patterns.
@@ -1211,7 +1273,7 @@ int main(int argc, char **argv) {
 	 * Convert optional PassNT, PassLM and PassNTLMv2 strings to hashes
 	 * unless plaintext pass was used, which has higher priority.
 	 *
-	 * If plain password is present, calculate its NT and LM hashes 
+	 * If plain password is present, calculate its NT and LM hashes
 	 * and remove it from the memory.
 	 */
 	if (!strlen(cpassword)) {
@@ -1479,7 +1541,7 @@ int main(int argc, char **argv) {
 		tv.tv_usec = 0;
 
 		/*
-		 * Wait here for data (connection request) on any of the listening 
+		 * Wait here for data (connection request) on any of the listening
 		 * sockets. When ready, establish the connection. For the main
 		 * port, a new proxy_thread() thread is spawned to service the HTTP
 		 * request. For tunneled ports, tunnel_thread() thread is created
